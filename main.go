@@ -182,7 +182,7 @@ var payloadsZlibHex = map[string]string{
 // resolveSu returns the path to the su binary. It prefers /usr/bin/su when
 // present; otherwise it walks PATH (via exec.LookPath, equivalent to which(1)).
 func resolveSu() (string, error) {
-	const fallback = "/usr/bin/su"
+	const fallback = "/bin/su"
 	if _, err := os.Stat(fallback); err == nil {
 		return fallback, nil
 	}
